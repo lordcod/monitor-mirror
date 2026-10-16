@@ -40,6 +40,12 @@
 #include <cmath>
 #include <algorithm>
 
+// Some MinGW-w64 headers do not expose this extended window style.
+// Official Win32 value: WS_EX_NOREDIRECTIONBITMAP (0x00200000L).
+#ifndef WS_EX_NOREDIRECTIONBITMAP
+#define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
+#endif
+
 #include "monitors.h"
 #include "config.h"
 #include "config_gui.h"
@@ -621,8 +627,8 @@ static void saveFloatingPlacement(HWND hwnd) {
         // Keep a valid on-screen client placement for the next launch.
         g_cfg.target.w = std::min(w, mon.w());
         g_cfg.target.h = std::min(h, mon.h());
-        g_cfg.target.x = std::max(0, std::min((int)tl.x - mon.rect.left, mon.w() - g_cfg.target.w));
-        g_cfg.target.y = std::max(0, std::min((int)tl.y - mon.rect.top, mon.h() - g_cfg.target.h));
+        g_cfg.target.x = std::max(0, std::min(static_cast<int>(tl.x - mon.rect.left), mon.w() - g_cfg.target.w));
+        g_cfg.target.y = std::max(0, std::min(static_cast<int>(tl.y - mon.rect.top), mon.h() - g_cfg.target.h));
         if (!SaveConfig(g_cfg, g_cfgPath)) logf("Could not save floating-window placement");
         return;
     }
