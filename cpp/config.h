@@ -1,0 +1,213 @@
+// ===========================================================================
+// config.h - Mirror configuration: model, load/save, and validation.
+//
+// The config describes WHAT to mirror and WHERE:
+//   source : a monitor + a pixel rectangle on it (the drawing / working area)
+//   target : a monitor + a rectangle on it (where the mirror is shown), whose
+//            aspect ratio is locked to the source rectangle's (accounting for
+//            rotation). The target may instead be a floating, movable/resizable
+//            window (windowed mode) - handy for single-monitor use and OBS.
+//   fps / rotation / flip / cover / cursor / vsync / log : options.
+//
+// Rectangles are stored MONITOR-LOCAL (0,0 = that monitor's top-left) so a
+// config stays meaningful if the desktop is rearranged. Monitors are keyed by a
+// stable hardware id (EDID-derived) with the \\.\DISPLAYx device name as a
+// fallback, so re-plugging that renumbers displays doesn't break the config.
+//
+// The file is a tiny INI, auto-loaded/auto-saved in LocalAppData\\MonitorMirror.
+// ===========================================================================
+#pragma once
+#include <windows.h>
+#include <string>
+#include <vector>
+#include <cstdio>
+#include <cwchar>
+#include "monitors.h"
+
+struct RegionCfg {
+    std::wstring device;              // \\.\DISPLAYx (fallback key)
+    std::wstring hwid;                // stable hardware id (primary key)
+    int x = 0, y = 0, w = 0, h = 0;   // rectangle, monitor-local pixels
+};
+
+struct MirrorConfig {
+    RegionCfg source;
+    RegionCfg target;
+    int  fps      = 0;        // 0 = uncapped
+    bool vsync    = false;
+    bool cursor   = true;
+    bool cover    = true;     // fill the rest of the mirror monitor black
+    bool windowed = true;     // default: freely movable/resizable floating preview
+    int  rotation = 0;        // 0 / 90 / 180 / 270 degrees (clockwise)
+    bool flipH    = false;    // mirror horizontally
+    bool flipV    = false;    // mirror vertically
+    bool log      = false;    // write mirror.log in LocalAppData
+
+    double srcAspect() const { return source.h ? (double)source.w / source.h : 1.0; }
+    // aspect the TARGET rectangle must have: rotation by 90/270 swaps w/h.
+    double effTargetAspect() const {
+        if (!source.w || !source.h) return 1.0;
+        bool swap = (rotation == 90 || rotation == 270);
+        return swap ? (double)source.h / source.w : (double)source.w / source.h;
+    }
+};
+
+// ---- paths ---------------------------------------------------------------
+// Program Files is read-only for normal user accounts. Never store mutable
+// settings/logs next to the executable. Each Windows account gets its own data.
+inline std::wstring ExeDir() {
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::wstring s(path);
+    size_t slash = s.find_last_of(L"\\/");
+    return (slash == std::wstring::npos) ? L"." : s.substr(0, slash);
+}
+inline std::wstring DataDir() {
+    wchar_t base[32768] = {};
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, 32768);
+    if (!n || n >= 32768) return L"";
+    std::wstring folder = std::wstring(base) + L"\\MonitorMirror";
+    if (!CreateDirectoryW(folder.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return L"";
+    return folder;
+}
+inline std::wstring DefaultConfigPath() {
+    auto d = DataDir();
+    return d.empty() ? L"" : d + L"\\mirror.cfg";
+}
+inline std::wstring DefaultLogPath() {
+    auto d = DataDir();
+    return d.empty() ? L"" : d + L"\\mirror.log";
+}
+
+// First run of this fork: migrate old portable mirror.cfg if there is one.
+// Never overwrite a config already stored in LocalAppData.
+inline bool MigrateLegacyConfig(const std::wstring& dest) {
+    if (dest.empty() || GetFileAttributesW(dest.c_str()) != INVALID_FILE_ATTRIBUTES) return false;
+    auto old = ExeDir() + L"\\mirror.cfg";
+    return CopyFileW(old.c_str(), dest.c_str(), TRUE) != 0;
+}
+
+// ---- monitor resolution: stable hwid first, device name as fallback --------
+inline int ResolveMonitor(const std::vector<MonitorInfo>& mons, const RegionCfg& r) {
+    if (!r.hwid.empty()) {
+        for (size_t i = 0; i < mons.size(); ++i)
+            if (!mons[i].hwid.empty() && mons[i].hwid == r.hwid) return (int)i;
+    }
+    return FindMonitor(mons, r.device);   // fall back to \\.\DISPLAYx
+}
+
+// ---- tiny INI writer/reader ------------------------------------------------
+inline bool SaveConfig(const MirrorConfig& c, const std::wstring& path) {
+    if (path.empty()) return false;
+    FILE* f = _wfopen(path.c_str(), L"w, ccs=UTF-8");
+    if (!f) return false;
+    // NOTE: %ls (not %s) - in this CRT's wide fwprintf, %s treats the argument
+    // as a narrow string and truncates the wchar_t* at its first zero byte.
+    fwprintf(f, L"# mirror configuration\n");
+    fwprintf(f, L"[source]\ndevice=%ls\nhwid=%ls\nx=%d\ny=%d\nw=%d\nh=%d\n",
+             c.source.device.c_str(), c.source.hwid.c_str(), c.source.x, c.source.y, c.source.w, c.source.h);
+    fwprintf(f, L"[target]\ndevice=%ls\nhwid=%ls\nx=%d\ny=%d\nw=%d\nh=%d\n",
+             c.target.device.c_str(), c.target.hwid.c_str(), c.target.x, c.target.y, c.target.w, c.target.h);
+    fwprintf(f, L"[options]\nfps=%d\nvsync=%d\ncursor=%d\ncover=%d\nwindowed=%d\nrotation=%d\nfliph=%d\nflipv=%d\nlog=%d\n",
+             c.fps, c.vsync?1:0, c.cursor?1:0, c.cover?1:0, c.windowed?1:0, c.rotation, c.flipH?1:0, c.flipV?1:0, c.log?1:0);
+    fclose(f);
+    return true;
+}
+
+inline bool LoadConfig(MirrorConfig& c, const std::wstring& path) {
+    if (path.empty()) return false;
+    FILE* f = _wfopen(path.c_str(), L"r, ccs=UTF-8");
+    if (!f) return false;
+    wchar_t line[512];
+    std::wstring section;
+    bool sawSource = false, sawTarget = false;
+    while (fgetws(line, 512, f)) {
+        std::wstring s(line);
+        size_t a = s.find_first_not_of(L" \t\r\n");
+        if (a == std::wstring::npos) continue;
+        size_t b = s.find_last_not_of(L" \t\r\n");
+        s = s.substr(a, b - a + 1);
+        if (s.empty() || s[0] == L'#' || s[0] == L';') continue;
+        if (s[0] == L'[') { section = s.substr(1, s.find(L']') - 1); continue; }
+
+        size_t eq = s.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring key = s.substr(0, eq), val = s.substr(eq + 1);
+
+        RegionCfg* r = nullptr;
+        if (section == L"source") { r = &c.source; sawSource = true; }
+        else if (section == L"target") { r = &c.target; sawTarget = true; }
+
+        if (r) {
+            if      (key == L"device") r->device = val;
+            else if (key == L"hwid")   r->hwid = val;
+            else if (key == L"x") r->x = _wtoi(val.c_str());
+            else if (key == L"y") r->y = _wtoi(val.c_str());
+            else if (key == L"w") r->w = _wtoi(val.c_str());
+            else if (key == L"h") r->h = _wtoi(val.c_str());
+        } else if (section == L"options") {
+            if      (key == L"fps")      c.fps      = _wtoi(val.c_str());
+            else if (key == L"vsync")    c.vsync    = _wtoi(val.c_str()) != 0;
+            else if (key == L"cursor")   c.cursor   = _wtoi(val.c_str()) != 0;
+            else if (key == L"cover")    c.cover    = _wtoi(val.c_str()) != 0;
+            else if (key == L"windowed") c.windowed = _wtoi(val.c_str()) != 0;
+            else if (key == L"rotation") c.rotation = _wtoi(val.c_str());
+            else if (key == L"fliph")    c.flipH    = _wtoi(val.c_str()) != 0;
+            else if (key == L"flipv")    c.flipV    = _wtoi(val.c_str()) != 0;
+            else if (key == L"log")      c.log      = _wtoi(val.c_str()) != 0;
+        }
+    }
+    fclose(f);
+    if (c.rotation != 0 && c.rotation != 90 && c.rotation != 180 && c.rotation != 270) c.rotation = 0;
+    return sawSource && sawTarget && !c.source.device.empty() && !c.target.device.empty();
+}
+
+// ---- validation against the CURRENT monitors -------------------------------
+// Returns an empty string if the config is usable right now, otherwise a
+// human-readable reason (shown as the banner in the setup dialog).
+inline std::wstring ValidateConfig(const MirrorConfig& c, const std::vector<MonitorInfo>& mons) {
+    if (mons.empty())
+        return L"No monitors were detected.";
+
+    int si = ResolveMonitor(mons, c.source);
+    if (si < 0)
+        return L"The main working monitor from your configuration is not connected.";
+    int ti = ResolveMonitor(mons, c.target);
+    if (ti < 0)
+        return L"The mirror monitor from your configuration is not connected.";
+    if (si == ti && !c.windowed)
+        return L"The working monitor and the mirror monitor are the same. Pick two different "
+               L"monitors, or turn on \"Floating window\".";
+
+    const MonitorInfo& sm = mons[si];
+    const MonitorInfo& tm = mons[ti];
+
+    if (c.source.w < 8 || c.source.h < 8)
+        return L"The working area is too small.";
+    if (c.source.x < 0 || c.source.y < 0 ||
+        c.source.x + c.source.w > sm.w() || c.source.y + c.source.h > sm.h())
+        return L"The working area no longer fits on the main monitor "
+               L"(its resolution may have changed).";
+
+    if (c.target.w < 8 || c.target.h < 8)
+        return L"The mirror area is too small.";
+    if (!c.windowed && (c.target.x < 0 || c.target.y < 0 ||
+        c.target.x + c.target.w > tm.w() || c.target.y + c.target.h > tm.h()))
+        return L"The mirror area no longer fits on the mirror monitor "
+               L"(its resolution may have changed).";
+
+    // aspect ratio must match the (rotation-adjusted) working area; allow ~2% drift.
+    double sa = c.effTargetAspect();
+    double ta = c.target.h ? (double)c.target.w / c.target.h : 0.0;
+    if (!c.windowed && sa > 0 && ta > 0) {
+        double diff = (sa > ta) ? (sa - ta) / sa : (ta - sa) / ta;
+        if (diff > 0.02)
+            return L"The mirror area no longer matches the working area's shape (aspect ratio).";
+    }
+
+    if (c.fps < 0 || c.fps > 1000)
+        return L"The frame rate is out of range (0-1000).";
+
+    return L"";  // OK
+}
